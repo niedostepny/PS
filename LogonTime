@@ -1,0 +1,221 @@
+<#
+Uruchomienie
+
+Zapisz np. jako:
+
+C:\Scripts\CzasUzytkownika.ps1
+
+i uruchom PowerShell jako administrator:
+
+Set-ExecutionPolicy -Scope Process Bypass
+
+następnie:
+
+C:\Scripts\CzasUzytkownika.ps1 -UserName "jan.kowalski" -Days 7
+
+albo np.:
+
+.\CzasUzytkownika.ps1 -UserName "j.kowalski" -Days 30
+
+/#>
+
+
+```powershell
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$UserName,
+
+    [int]$Days = 7
+)
+
+$StartTime = (Get-Date).AddDays(-$Days)
+
+Write-Host ""
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host " HISTORIA AKTYWNOŚCI UŻYTKOWNIKA" -ForegroundColor Cyan
+Write-Host " Użytkownik: $UserName" -ForegroundColor Cyan
+Write-Host " Okres: ostatnie $Days dni" -ForegroundColor Cyan
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Pobranie interesujących zdarzeń
+$Events = Get-WinEvent -FilterHashtable @{
+    LogName   = 'Security'
+    Id        = 4624,4634,4647,4800,4801
+    StartTime = $StartTime
+} -ErrorAction SilentlyContinue
+
+$Result = foreach ($Event in $Events) {
+
+    $Xml = [xml]$Event.ToXml()
+
+    $Data = @{}
+
+    foreach ($Item in $Xml.Event.EventData.Data) {
+        if ($Item.Name) {
+            $Data[$Item.Name] = $Item.'#text'
+        }
+    }
+
+    $Account = $Data['TargetUserName']
+
+    # Pomijamy SYSTEM, LOCAL SERVICE, NETWORK SERVICE itd.
+    if ([string]::IsNullOrWhiteSpace($Account)) {
+        continue
+    }
+
+    if ($Account -ieq $UserName) {
+
+        $Type = switch ($Event.Id) {
+
+            4624 {
+                switch ($Data['LogonType']) {
+                    '2'  { 'LOGON' }
+                    '7'  { 'UNLOCK' }
+                    '10' { 'RDP LOGON' }
+                    '11' { 'LOGON' }
+                    default { $null }
+                }
+            }
+
+            4634 { 'LOGOFF' }
+
+            4647 { 'LOGOFF' }
+
+            4800 { 'LOCK' }
+
+            4801 { 'UNLOCK' }
+
+            default { $null }
+        }
+
+        if ($Type) {
+
+            [PSCustomObject]@{
+                Time      = $Event.TimeCreated
+                EventId   = $Event.Id
+                Type      = $Type
+                User      = $Account
+                Computer  = $env:COMPUTERNAME
+            }
+        }
+    }
+}
+
+$EventsSorted = $Result | Sort-Object Time
+
+if (-not $EventsSorted) {
+    Write-Host "Nie znaleziono zdarzeń dla użytkownika $UserName." -ForegroundColor Yellow
+    exit
+}
+
+# Wyświetlenie chronologicznej historii
+Write-Host "ZDARZENIA:" -ForegroundColor Green
+Write-Host ""
+
+$EventsSorted | Format-Table `
+    @{Name="Data/Czas";Expression={$_.Time.ToString("yyyy-MM-dd HH:mm:ss")}},
+    @{Name="Typ";Expression={$_.Type}},
+    @{Name="Event ID";Expression={$_.EventId}},
+    @{Name="Użytkownik";Expression={$_.User}} `
+    -AutoSize
+
+# ----------------------------------------------------
+# Wyliczenie czasu aktywności
+# ----------------------------------------------------
+
+$LogonTime = $null
+$LockTime = $null
+
+$Sessions = @()
+
+foreach ($Event in $EventsSorted) {
+
+    switch ($Event.Type) {
+
+        "LOGON" {
+            if (-not $LogonTime) {
+                $LogonTime = $Event.Time
+            }
+        }
+
+        "RDP LOGON" {
+            if (-not $LogonTime) {
+                $LogonTime = $Event.Time
+            }
+        }
+
+        "UNLOCK" {
+            if (-not $LogonTime) {
+                $LogonTime = $Event.Time
+            }
+
+            if ($LockTime) {
+
+                $LockedDuration = $Event.Time - $LockTime
+
+                $Sessions += [PSCustomObject]@{
+                    Start          = $LogonTime
+                    Unlock         = $Event.Time
+                    LockedTime     = $LockedDuration
+                    ActiveTime     = $null
+                    End            = $null
+                }
+
+                $LockTime = $null
+            }
+        }
+
+        "LOCK" {
+            if ($LogonTime -and -not $LockTime) {
+                $LockTime = $Event.Time
+            }
+        }
+
+        "LOGOFF" {
+            if ($LogonTime) {
+
+                $ActiveEnd = $Event.Time
+
+                if ($LockTime) {
+                    $ActiveEnd = $LockTime
+                }
+
+                $ActiveDuration = $ActiveEnd - $LogonTime
+
+                $Sessions += [PSCustomObject]@{
+                    Start      = $LogonTime
+                    Unlock     = $null
+                    LockedTime = if ($LockTime) {
+                        $Event.Time - $LockTime
+                    } else {
+                        [TimeSpan]::Zero
+                    }
+                    ActiveTime = $ActiveDuration
+                    End        = $Event.Time
+                }
+
+                $LogonTime = $null
+                $LockTime = $null
+            }
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host " PODSUMOWANIE SESJI" -ForegroundColor Cyan
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host ""
+
+$Sessions | ForEach-Object {
+
+    [PSCustomObject]@{
+        "Start"       = if ($_.Start) { $_.Start.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
+        "Koniec"      = if ($_.End) { $_.End.ToString("yyyy-MM-dd HH:mm:ss") } else { "Nadal zalogowany" }
+        "Aktywny"     = if ($_.ActiveTime) { $_.ActiveTime.ToString("hh\:mm\:ss") } else { "" }
+        "Zablokowany" = if ($_.LockedTime) { $_.LockedTime.ToString("hh\:mm\:ss") } else { "" }
+    }
+
+} | Format-Table -AutoSize
+```
