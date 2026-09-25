@@ -1,0 +1,451 @@
+<#
+Uruchomienie
+
+Dla użytkownika jan.kowalski i ostatnich 7 dni:
+
+.\RaportCzasu.ps1 -UserName "jan.kowalski" -Days 7
+
+Dla ostatnich 30 dni:
+
+.\RaportCzasu.ps1 -UserName "jan.kowalski" -Days 30
+
+Jeżeli konto jest domenowe, wystarczy podać nazwę użytkownika:
+
+.\RaportCzasu.ps1 -UserName "jkowalski" -Days 30
+
+/#>
+
+```powershell
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$UserName,
+
+    [int]$Days = 7,
+
+    [string]$CsvPath = ".\Raport_$($UserName)_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+)
+
+# ============================================================
+# KONFIGURACJA
+# ============================================================
+
+$StartTime = (Get-Date).AddDays(-$Days)
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " RAPORT AKTYWNOŚCI UŻYTKOWNIKA" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "Użytkownik : $UserName"
+Write-Host "Komputer   : $env:COMPUTERNAME"
+Write-Host "Od         : $($StartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-Host "Do         : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Host ""
+
+# ============================================================
+# POBRANIE ZDARZEŃ
+# ============================================================
+
+Write-Host "Pobieranie zdarzeń Security..." -ForegroundColor Yellow
+
+$RawEvents = Get-WinEvent -FilterHashtable @{
+    LogName   = 'Security'
+    Id        = 4624,4634,4647,4800,4801
+    StartTime = $StartTime
+} -ErrorAction SilentlyContinue
+
+$Events = foreach ($Event in $RawEvents) {
+
+    try {
+        $Xml = [xml]$Event.ToXml()
+        $Data = @{}
+
+        foreach ($Item in $Xml.Event.EventData.Data) {
+            if ($Item.Name) {
+                $Data[$Item.Name] = $Item.'#text'
+            }
+        }
+
+        $Account = $Data['TargetUserName']
+        $Domain  = $Data['TargetDomainName']
+
+        if ([string]::IsNullOrWhiteSpace($Account)) {
+            continue
+        }
+
+        # Obsługa DOMAIN\User oraz samej nazwy użytkownika
+        $ShortUserName = $UserName.Split('\')[-1]
+
+        if ($Account -ine $ShortUserName) {
+            continue
+        }
+
+        $Type = $null
+
+        switch ($Event.Id) {
+
+            # LOGON
+            4624 {
+                switch ($Data['LogonType']) {
+                    '2'  { $Type = 'LOGON' }
+                    '7'  { $Type = 'UNLOCK' }
+                    '10' { $Type = 'RDP LOGON' }
+                    '11' { $Type = 'LOGON' }
+                }
+            }
+
+            # LOGOFF
+            4634 {
+                $Type = 'LOGOFF'
+            }
+
+            # LOGOFF zainicjowany przez użytkownika
+            4647 {
+                $Type = 'LOGOFF'
+            }
+
+            # LOCK
+            4800 {
+                $Type = 'LOCK'
+            }
+
+            # UNLOCK
+            4801 {
+                $Type = 'UNLOCK'
+            }
+        }
+
+        if ($Type) {
+
+            [PSCustomObject]@{
+                Time     = $Event.TimeCreated
+                Type     = $Type
+                EventId  = $Event.Id
+                User     = $Account
+                Domain   = $Domain
+                LogonId  = $Data['TargetLogonId']
+            }
+        }
+
+    } catch {
+        # Pomijamy uszkodzone/nieparsowalne zdarzenie
+    }
+}
+
+$Events = $Events | Sort-Object Time
+
+if (-not $Events) {
+
+    Write-Host ""
+    Write-Host "Nie znaleziono zdarzeń dla użytkownika: $UserName" -ForegroundColor Red
+    Write-Host ""
+
+    exit
+}
+
+Write-Host "Znaleziono $($Events.Count) zdarzeń." -ForegroundColor Green
+Write-Host ""
+
+# ============================================================
+# WYŚWIETLENIE HISTORII ZDARZEŃ
+# ============================================================
+
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " HISTORIA ZDARZEŃ" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+$Events |
+    Select-Object `
+        @{Name="Data";Expression={$_.Time.ToString("yyyy-MM-dd")}},
+        @{Name="Czas";Expression={$_.Time.ToString("HH:mm:ss")}},
+        Type,
+        EventId |
+    Format-Table -AutoSize
+
+# ============================================================
+# GRUPOWANIE ZDARZEŃ WEDŁUG DNIA
+# ============================================================
+
+$DaysReport = @()
+
+$GroupedDays = $Events |
+    Group-Object { $_.Time.Date } |
+    Sort-Object Name
+
+foreach ($DayGroup in $GroupedDays) {
+
+    $Day = [datetime]$DayGroup.Name
+    $DayEvents = $DayGroup.Group | Sort-Object Time
+
+    $LogonTime = $null
+    $LastLockTime = $null
+
+    $TotalActive = [TimeSpan]::Zero
+    $TotalLocked = [TimeSpan]::Zero
+    $TotalSession = [TimeSpan]::Zero
+
+    $FirstLogon = $null
+    $LastLogoff = $null
+
+    foreach ($Event in $DayEvents) {
+
+        switch ($Event.Type) {
+
+            # ------------------------------------------------
+            # LOGOWANIE
+            # ------------------------------------------------
+
+            "LOGON" {
+
+                if (-not $LogonTime) {
+
+                    $LogonTime = $Event.Time
+
+                    if (-not $FirstLogon) {
+                        $FirstLogon = $Event.Time
+                    }
+                }
+            }
+
+            # ------------------------------------------------
+            # RDP LOGON
+            # ------------------------------------------------
+
+            "RDP LOGON" {
+
+                if (-not $LogonTime) {
+
+                    $LogonTime = $Event.Time
+
+                    if (-not $FirstLogon) {
+                        $FirstLogon = $Event.Time
+                    }
+                }
+            }
+
+            # ------------------------------------------------
+            # UNLOCK
+            # ------------------------------------------------
+
+            "UNLOCK" {
+
+                # Jeśli nie mamy początku sesji,
+                # traktujemy odblokowanie jako początek
+                if (-not $LogonTime) {
+
+                    $LogonTime = $Event.Time
+
+                    if (-not $FirstLogon) {
+                        $FirstLogon = $Event.Time
+                    }
+                }
+
+                # Zamykamy okres blokady
+                if ($LastLockTime) {
+
+                    $Locked = $Event.Time - $LastLockTime
+
+                    if ($Locked.TotalSeconds -gt 0) {
+                        $TotalLocked += $Locked
+                    }
+
+                    $LastLockTime = $null
+                }
+            }
+
+            # ------------------------------------------------
+            # LOCK
+            # ------------------------------------------------
+
+            "LOCK" {
+
+                if ($LogonTime -and -not $LastLockTime) {
+
+                    $LastLockTime = $Event.Time
+                }
+            }
+
+            # ------------------------------------------------
+            # LOGOFF
+            # ------------------------------------------------
+
+            "LOGOFF" {
+
+                if ($LogonTime) {
+
+                    $LastLogoff = $Event.Time
+
+                    $Session = $Event.Time - $LogonTime
+
+                    if ($Session.TotalSeconds -gt 0) {
+                        $TotalSession += $Session
+                    }
+
+                    # Jeżeli komputer był zablokowany
+                    # aż do wylogowania
+                    if ($LastLockTime) {
+
+                        $Locked = $Event.Time - $LastLockTime
+
+                        if ($Locked.TotalSeconds -gt 0) {
+                            $TotalLocked += $Locked
+                        }
+
+                        $LastLockTime = $null
+                    }
+
+                    $LogonTime = $null
+                }
+            }
+        }
+    }
+
+    # --------------------------------------------------------
+    # Jeśli użytkownik nadal jest zalogowany
+    # --------------------------------------------------------
+
+    if ($LogonTime) {
+
+        $Now = Get-Date
+
+        $Session = $Now - $LogonTime
+
+        if ($Session.TotalSeconds -gt 0) {
+            $TotalSession += $Session
+        }
+
+        if ($LastLockTime) {
+
+            $Locked = $Now - $LastLockTime
+
+            if ($Locked.TotalSeconds -gt 0) {
+                $TotalLocked += $Locked
+            }
+        }
+
+        $LastLogoff = $null
+    }
+
+    # --------------------------------------------------------
+    # RZECZYWISTY CZAS AKTYWNY
+    # --------------------------------------------------------
+
+    $TotalActive = $TotalSession - $TotalLocked
+
+    if ($TotalActive.TotalSeconds -lt 0) {
+        $TotalActive = [TimeSpan]::Zero
+    }
+
+    # --------------------------------------------------------
+    # RAPORT
+    # --------------------------------------------------------
+
+    $DaysReport += [PSCustomObject]@{
+
+        Data = $Day.ToString("yyyy-MM-dd")
+
+        "Pierwsze logowanie" =
+            if ($FirstLogon) {
+                $FirstLogon.ToString("HH:mm:ss")
+            }
+            else {
+                ""
+            }
+
+        "Ostatnie wylogowanie" =
+            if ($LastLogoff) {
+                $LastLogoff.ToString("HH:mm:ss")
+            }
+            elseif ($LogonTime) {
+                "NADAL ZALOGOWANY"
+            }
+            else {
+                ""
+            }
+
+        "Czas sesji" =
+            $TotalSession.ToString("hh\:mm\:ss")
+
+        "Czas zablokowania" =
+            $TotalLocked.ToString("hh\:mm\:ss")
+
+        "Czas aktywny" =
+            $TotalActive.ToString("hh\:mm\:ss")
+    }
+}
+
+# ============================================================
+# RAPORT DZIENNY
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host " RAPORT DZIENNY" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host ""
+
+$DaysReport | Format-Table -AutoSize
+
+# ============================================================
+# SZCZEGÓŁOWE OKRESY BLOKAD
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Yellow
+Write-Host " OKRESY BLOKAD KOMPUTERA" -ForegroundColor Yellow
+Write-Host "============================================================" -ForegroundColor Yellow
+Write-Host ""
+
+$LockStart = $null
+
+foreach ($Event in $Events) {
+
+    if ($Event.Type -eq "LOCK") {
+
+        if (-not $LockStart) {
+            $LockStart = $Event.Time
+        }
+    }
+
+    if ($Event.Type -eq "UNLOCK") {
+
+        if ($LockStart) {
+
+            $Duration = $Event.Time - $LockStart
+
+            [PSCustomObject]@{
+                Data       = $LockStart.ToString("yyyy-MM-dd")
+                "Blokada"  = $LockStart.ToString("HH:mm:ss")
+                "Odblokowanie" = $Event.Time.ToString("HH:mm:ss")
+                "Czas blokady" = $Duration.ToString("hh\:mm\:ss")
+            } | Format-Table -AutoSize
+
+            $LockStart = $null
+        }
+    }
+}
+
+# ============================================================
+# EKSPORT CSV
+# ============================================================
+
+try {
+
+    $DaysReport | Export-Csv `
+        -Path $CsvPath `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+    Write-Host ""
+    Write-Host "Raport CSV zapisany:" -ForegroundColor Green
+    Write-Host $((Resolve-Path $CsvPath).Path) -ForegroundColor White
+    Write-Host ""
+
+}
+catch {
+
+    Write-Host ""
+    Write-Host "Nie udało się zapisać raportu CSV." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+}
+```
